@@ -1,0 +1,75 @@
+# =============================================================================
+# htaccess.sample  --  メンテナンスモード（Apache 用）
+#
+#   A. 手動スイッチ : フラグファイルを置くと、全アクセスを 503 + メンテ画面にする
+#   B. 自動フォールバック : バックエンド(PHP-FPM)が落ちて 502/503/504 になったら
+#                         同じメンテ画面を表示する
+#
+# 使い方:
+#   1) public/maintenance.html を「公開ディレクトリ直下」にコピーする
+#   2) このファイルを公開ディレクトリに .htaccess としてコピー（または vhost に貼る）
+#   3) 「★」の付いた箇所だけ環境に合わせて書き換える
+#
+# 必要なモジュール: mod_rewrite, mod_headers
+# .htaccess を使う場合は AllowOverride FileInfo（Headers も使うなら All）が必要
+# =============================================================================
+
+# --- B. 自動フォールバック ----------------------------------------------------
+# ErrorDocument にローカルパスを書くと、ステータスコード(503等)を保ったまま
+# その HTML を返す。※ http:// から始まる URL を書くとリダイレクトになり 302 に
+# 変わってしまうので、必ず「/」から始まるパスにすること。
+ErrorDocument 502 /maintenance.html
+ErrorDocument 503 /maintenance.html
+ErrorDocument 504 /maintenance.html
+
+# --- A. 手動スイッチ ----------------------------------------------------------
+#   有効化:  sudo touch /var/www/maintenance.flag
+#   解除:    sudo rm    /var/www/maintenance.flag
+#   ※ Apache の再起動は不要（リクエストのたびにファイルの有無を見る）
+#   ※ フラグは公開ディレクトリの「外」に置く
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # フラグファイルがあるとき                             ★ 場所は変更可
+    RewriteCond /var/www/maintenance.flag -f
+    # 保守担当者の IP は除外                                ★ 自分の IP に変更
+    RewriteCond %{REMOTE_ADDR} !^203\.0\.113\.10$
+    # メンテ画面自体は除外（ループ防止）
+    RewriteCond %{REQUEST_URI} !^/maintenance\.html$
+    # 503 を返す → 上の ErrorDocument が maintenance.html を表示する
+    RewriteRule ^ - [R=503,L]
+</IfModule>
+
+# --- ヘッダー -----------------------------------------------------------------
+# ※ Apache はディレクティブ行の末尾にコメントを書くと構文エラーになる。
+#   コメントは必ず独立した行に書くこと。
+<IfModule mod_headers.c>
+    <Files "maintenance.html">
+        # Retry-After: 1時間後に再試行してね（検索エンジン・クライアント向け）
+        Header always set Retry-After   "3600"
+        # Cache-Control: ブラウザ/CDN にメンテ画面を残さない
+        Header always set Cache-Control "no-store"
+        Header always set X-Robots-Tag  "noindex"
+    </Files>
+</IfModule>
+
+# =============================================================================
+# 動作確認
+#   1) sudo touch /var/www/maintenance.flag
+#      curl -I http://example.com/      -> HTTP/1.1 503 Service Unavailable
+#   2) sudo rm /var/www/maintenance.flag
+#   3) sudo systemctl stop php8.3-fpm
+#      curl -I http://example.com/x.php -> 503（自動フォールバック）
+#      sudo systemctl start php8.3-fpm
+#
+# 注意（制限事項）
+#   - mod_php 構成では、PHP がクラッシュすると Apache の子プロセスごと落ちて
+#     接続が切れるため、ErrorDocument が働かない場合がある。
+#     自動フォールバックを確実にしたいなら PHP-FPM（mod_proxy_fcgi）構成にする。
+#   - ErrorDocument はステータスコードを書き換えない。バックエンドが 502 / 504 を
+#     返した場合は、メンテ画面が「502 / 504 のまま」返る（Nginx の =503 のような変換は
+#     できない）。PHP-FPM への接続拒否は 503 になるが、名前解決の失敗などは 502 になる。
+#     ステータスを 503 に揃えたい場合は、前段のエッジ層（config/edge/）で変換する。
+#   - Apache 自体が停止している場合は、この仕組みでは何も返せない。
+#     その層は前段の LB / CDN 側のエラーページで担保する（README 参照）。
+# =============================================================================

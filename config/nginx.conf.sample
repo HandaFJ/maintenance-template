@@ -1,0 +1,113 @@
+# =============================================================================
+# nginx.conf.sample  --  メンテナンスモード（Nginx 用）
+#
+# 2つの仕組みを1つの設定で実現します。
+#   A. 手動スイッチ : フラグファイルを置くと、全アクセスを 503 + メンテ画面にする
+#   B. 自動フォールバック : PHP-FPM / アップストリームが落ちたら 502/504 を検知し、
+#                         同じメンテ画面に切り替える（人が気づく前に動く）
+#
+# 使い方: このファイルを /etc/nginx/conf.d/ 等にコピーし、
+#         「★」の付いた箇所だけ自分の環境に合わせて書き換える。
+#         反映前に必ず `nginx -t` で構文チェックすること。
+# =============================================================================
+
+# --- http コンテキスト（conf.d 直下に置けば自動的に http 内に入る） ---------
+
+# 保守担当者の IP は、メンテ中でも本番サイトを確認できるようにする。
+# ★ 自分の固定 IP に変更（複数行 OK）。不要なら 1 行も残さなくてよい。
+geo $maintenance_bypass {
+    default          0;
+    203.0.113.10     1;    # 例: オフィスのグローバル IP
+}
+
+server {
+    listen 80;
+    server_name example.com;                         # ★
+    root /var/www/example.com/public;                # ★ アプリの公開ディレクトリ
+    index index.php index.html;
+
+    # -------------------------------------------------------------------------
+    # A. 手動スイッチ
+    #    有効化:  sudo touch /var/www/maintenance.flag
+    #    解除:    sudo rm    /var/www/maintenance.flag
+    #    ※ nginx の reload は不要（アクセスのたびにファイルの有無を見るため）
+    #    ※ フラグは公開ディレクトリの「外」に置く（URL から見えないように）
+    # -------------------------------------------------------------------------
+    set $maintenance "";
+    if (-f /var/www/maintenance.flag) {              # ★ 好きな場所に変更可
+        set $maintenance "on";
+    }
+    if ($maintenance_bypass = 1) {                   # 保守担当者はスルー
+        set $maintenance "";
+    }
+    if ($maintenance = "on") {
+        return 503;
+    }
+
+    # -------------------------------------------------------------------------
+    # B. 自動フォールバック
+    #    502 = PHP-FPM が落ちている / 接続拒否
+    #    503 = 手動スイッチ or 上流が過負荷
+    #    504 = 上流が応答しない（タイムアウト）
+    #    "=503" を付けて、クライアントには常に 503 を返す
+    #    （検索エンジンに「一時的な停止」と正しく伝えるため）
+    # -------------------------------------------------------------------------
+    error_page 502 503 504 =503 @maintenance;
+    # アプリが 500 を返した場合もメンテ画面にしたいときは、上の行を次に変える。
+    # ただし通常のアプリエラー画面も隠れるので、緊急時限定の運用を推奨。
+    # error_page 500 502 503 504 =503 @maintenance;
+
+    location @maintenance {
+        # 静的 HTML を直接返す。PHP・DB・アプリには一切触れない。
+        root /var/www/my-maintenance-template/public;   # ★ このリポジトリの置き場所
+        rewrite ^ /maintenance.html break;
+
+        add_header Retry-After     3600                 always;  # 1時間後に再試行してね
+        add_header Cache-Control   "no-store"           always;  # ブラウザ/CDN に残さない
+        add_header X-Robots-Tag    "noindex"            always;
+    }
+
+    # -------------------------------------------------------------------------
+    # アプリ本体（PHP-FPM の例）
+    # -------------------------------------------------------------------------
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;     # ★ 環境に合わせる
+
+        # これが無いと、上流のエラーを error_page が拾ってくれない（重要）
+        fastcgi_intercept_errors on;
+
+        # 「落ちている」を素早く判定するためのタイムアウト。
+        #  - ソケットが無い / 接続拒否 → 即座に 502（待ち時間ほぼゼロ）
+        #  - 応答が固まっている        → 下の秒数で 504
+        fastcgi_connect_timeout 3s;
+        fastcgi_read_timeout    30s;                    # ★ アプリの最長処理に合わせる
+    }
+
+    # リバースプロキシ（Node / Rails など）の場合は、上の PHP ブロックの代わりに:
+    # location / {
+    #     proxy_pass http://127.0.0.1:3000;
+    #     proxy_intercept_errors on;    # fastcgi_intercept_errors の proxy 版
+    #     proxy_connect_timeout 3s;
+    #     proxy_read_timeout    30s;
+    # }
+
+    # 隠しファイルは公開しない
+    location ~ /\.(?!well-known) { deny all; }
+}
+
+# =============================================================================
+# 動作確認
+#   1) nginx -t && sudo systemctl reload nginx
+#   2) sudo touch /var/www/maintenance.flag
+#      curl -I http://example.com/      -> HTTP/1.1 503 + Retry-After
+#   3) sudo rm /var/www/maintenance.flag
+#   4) sudo systemctl stop php8.3-fpm
+#      curl -I http://example.com/x.php -> HTTP/1.1 503（自動フォールバック）
+#      sudo systemctl start php8.3-fpm
+# =============================================================================

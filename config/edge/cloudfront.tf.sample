@@ -1,0 +1,159 @@
+# =============================================================================
+# cloudfront.tf.sample  自動フォールバック（AWS CloudFront + S3 / Terraform 用）
+#
+# オリジン（ALB / EC2 / オンプレ）が 502・503・504 を返す、または接続できないとき、
+# S3 に置いた静的 maintenance.html を 503 で返します。
+# Web サーバーより手前の層なので、サーバーが丸ごと止まっていても動きます。
+#
+# ※ 抜粋サンプルです。ドメイン名・証明書・ログなどは環境に合わせて追加してください。
+# ※ 手動スイッチ（ON / OFF）は含みません。手動で止めたい場合は
+#    Nginx / Apache / IIS 側のフラグか、Cloudflare 版（KV）を使ってください。
+# =============================================================================
+
+variable "origin_domain" {
+  description = "アプリのオリジンのドメイン名（ALB など）"
+  type        = string
+  default     = "origin.example.com" # ★
+}
+
+# --- 1. メンテ画面を置く S3（非公開。CloudFront からだけ読める） ------------------
+
+resource "aws_s3_bucket" "maintenance" {
+  bucket = "example-maintenance-page" # ★ 世界で一意の名前
+}
+
+resource "aws_s3_bucket_public_access_block" "maintenance" {
+  bucket                  = aws_s3_bucket.maintenance.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_object" "maintenance_html" {
+  bucket        = aws_s3_bucket.maintenance.id
+  key           = "maintenance.html"
+  source        = "${path.module}/../../public/maintenance.html" # このリポジトリのファイル
+  etag          = filemd5("${path.module}/../../public/maintenance.html")
+  content_type  = "text/html; charset=utf-8"
+  cache_control = "max-age=60"
+}
+
+resource "aws_cloudfront_origin_access_control" "maintenance" {
+  name                              = "maintenance-oac"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+data "aws_iam_policy_document" "maintenance_bucket" {
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.maintenance.arn}/maintenance.html"]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.site.arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "maintenance" {
+  bucket = aws_s3_bucket.maintenance.id
+  policy = data.aws_iam_policy_document.maintenance_bucket.json
+}
+
+# --- 2. CloudFront ------------------------------------------------------------
+
+resource "aws_cloudfront_distribution" "site" {
+  enabled = true
+  comment = "site with maintenance fallback"
+
+  # アプリ本体のオリジン
+  origin {
+    origin_id   = "app"
+    domain_name = var.origin_domain
+
+    custom_origin_config {
+      http_port                = 80
+      https_port               = 443
+      origin_protocol_policy   = "https-only"
+      origin_ssl_protocols     = ["TLSv1.2"]
+      origin_read_timeout      = 30 # ★ アプリの最長処理に合わせる（超えると 504）
+      origin_keepalive_timeout = 5
+    }
+
+    # 「落ちている」を素早く判定する。既定の 3 回リトライだと待ち時間が長くなる
+    connection_attempts = 1
+    connection_timeout  = 3
+  }
+
+  # メンテ画面のオリジン（S3）
+  origin {
+    origin_id                = "maintenance"
+    domain_name              = aws_s3_bucket.maintenance.bucket_regional_domain_name
+    origin_access_control_id = aws_cloudfront_origin_access_control.maintenance.id
+  }
+
+  # 通常のアクセスはアプリへ（キャッシュ無効 + ヘッダー・Cookie などは全部転送）
+  default_cache_behavior {
+    target_origin_id         = "app"
+    viewer_protocol_policy   = "redirect-to-https"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # Managed-CachingDisabled
+    origin_request_policy_id = "216adef6-5c7f-47e4-b989-5492eafa07d3" # Managed-AllViewer
+  }
+
+  # メンテ画面だけ S3 から取る。
+  # CloudFront のカスタムエラーページは、「そのパスにマッチするビヘイビアのオリジン」から
+  # 取得される仕様のため、この設定が無いとエラーページを返せない。
+  ordered_cache_behavior {
+    path_pattern           = "/maintenance.html"
+    target_origin_id       = "maintenance"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    cache_policy_id        = "658327ea-f89d-4fab-a63d-7e88639e58f6" # Managed-CachingOptimized
+  }
+
+  # 502 / 503 / 504 のとき、S3 のメンテ画面を「503」で返す
+  dynamic "custom_error_response" {
+    for_each = [502, 503, 504]
+    content {
+      error_code            = custom_error_response.value
+      response_code         = 503
+      response_page_path    = "/maintenance.html"
+      error_caching_min_ttl = 10 # エラーを覚えておく秒数。短いほど復旧の反映が早い
+    }
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true # ★ 独自ドメインを使う場合は ACM 証明書に変更
+  }
+}
+
+# =============================================================================
+# 動作確認
+#   terraform init && terraform plan
+#   オリジンを意図的に止める（例: ALB のターゲットを全部外す）
+#   curl -I https://<distribution>.cloudfront.net/   -> HTTP/2 503
+#
+# 注意
+#   - 502/503/504 の応答は error_caching_min_ttl の間キャッシュされる。
+#     復旧直後に少しだけメンテ画面が残る可能性がある（10 秒設定の場合は最大 10 秒）。
+#   - メンテ画面の Retry-After ヘッダーは、この方式では確実に付けられない。
+#     Retry-After を重視する場合は、Cloudflare 版（Worker）か Web サーバー層を使う。
+#   - ALB の固定レスポンス（fixed-response）は本文が 1024 バイトまでなので、
+#     このテンプレートの HTML は載せられない。S3 + CloudFront 方式を推奨。
+# =============================================================================

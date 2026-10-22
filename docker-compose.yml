@@ -1,0 +1,67 @@
+# =============================================================================
+# docker-compose.yml  メンテナンスモードのデモ環境
+#
+#   入口 (edge)   : http://localhost:8080   エッジ層（CDN / LB 役の Nginx）
+#   直接 (web)    : http://localhost:8081   Webサーバー層（Nginx か Apache のどちらか）
+#
+#   Nginx 構成で起動 : docker compose --profile nginx  up -d
+#   Apache 構成で起動: docker compose --profile apache up -d
+#   ※ web 層は同じポート(8081)と別名(web)を使うため、どちらか一方だけ起動する。
+#
+#   障害の再現は Makefile を参照（make help）。
+# =============================================================================
+name: maintenance-demo
+
+services:
+  # --- エッジ層 ---------------------------------------------------------------
+  # Cloudflare / CloudFront の「5xx を検知してメンテ画面を返す」動きを模擬する。
+  # web 層が丸ごと止まっていても起動し続ける（depends_on を付けない）。
+  edge:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./docker/edge.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./public:/usr/share/nginx/maintenance:ro
+
+  # --- アプリ層 ---------------------------------------------------------------
+  # Nginx からも Apache からも同じ FPM に繋ぐため、両方のパスにアプリを載せる。
+  php:
+    image: php:8.3-fpm-alpine
+    volumes:
+      - ./docker/app:/usr/share/nginx/html:ro
+      - ./docker/app:/usr/local/apache2/htdocs:ro
+
+  # --- Webサーバー層（Nginx） -------------------------------------------------
+  web-nginx:
+    profiles: ["nginx"]
+    image: nginx:1.27-alpine
+    ports:
+      - "8081:80"
+    networks:
+      default:
+        aliases: [web]
+    depends_on: [php]
+    volumes:
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/app:/usr/share/nginx/html:ro
+      - ./public:/usr/share/nginx/maintenance:ro
+      - ./state:/var/www:ro          # maintenance.flag を置く場所
+
+  # --- Webサーバー層（Apache） ------------------------------------------------
+  # メンテ用の設定は config/htaccess.sample を「そのまま」読み込んで動かす。
+  web-apache:
+    profiles: ["apache"]
+    image: httpd:2.4-alpine
+    ports:
+      - "8081:80"
+    networks:
+      default:
+        aliases: [web]
+    depends_on: [php]
+    volumes:
+      - ./docker/apache/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+      - ./config/htaccess.sample:/usr/local/apache2/conf/maintenance.conf:ro
+      - ./docker/app:/usr/local/apache2/htdocs:ro
+      - ./public:/usr/local/apache2/maintenance:ro
+      - ./state:/var/www:ro          # maintenance.flag を置く場所

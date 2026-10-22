@@ -1,0 +1,112 @@
+// =============================================================================
+// cloudflare-worker.js.sample  メンテナンスモード（Cloudflare Workers 用）
+//
+// Nginx / Apache / IIS より「手前」で動く層です。
+// オリジンのサーバーが丸ごと止まっていても、メンテ画面を返せます。
+//
+//   A. 手動スイッチ     : KV に maintenance = "on" を入れると全アクセスを 503 にする
+//   B. 自動フォールバック : オリジンが 5xx を返す / 応答しないとき、メンテ画面を返す
+//
+// メンテ画面の HTML は、静的ホスティング（Cloudflare Pages / R2 / S3 など）に
+// public/maintenance.html を置き、その URL を MAINTENANCE_URL に設定します。
+// そこも取得できないときは、下の FALLBACK_HTML（最小限の画面）を返します。
+// =============================================================================
+
+// 最後の砦。MAINTENANCE_URL が取得できなくても、これだけは必ず返せる。
+const FALLBACK_HTML = `<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>メンテナンス中</title></head>
+<body style="margin:0;padding:12vw 8vw;background:#0e2530;color:#e8eef0;font-family:sans-serif;line-height:1.8">
+<h1>ただいまメンテナンス中です</h1>
+<p>サイトの安全を確認するため、公開を一時的に止めています。しばらくお待ちください。</p>
+</body></html>`;
+
+export default {
+  async fetch(request, env) {
+    const ip = request.headers.get("CF-Connecting-IP") || "";
+    const bypass = (env.BYPASS_IPS || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const isBypass = bypass.includes(ip);
+
+    // --- A. 手動スイッチ -----------------------------------------------------
+    if (!isBypass) {
+      let flag = null;
+      try {
+        flag = await env.FLAGS.get("maintenance");
+      } catch (_) {
+        // KV が読めなくても、サイトは止めない（フラグ取得の失敗で全停止しないため）
+      }
+      if (flag === "on") return maintenanceResponse(env);
+    }
+
+    // --- B. 自動フォールバック ------------------------------------------------
+    const timeoutMs = Number(env.ORIGIN_TIMEOUT_MS) || 15000;
+    let res;
+    try {
+      res = await fetch(request, { signal: AbortSignal.timeout(timeoutMs) });
+    } catch (_) {
+      // オリジンに接続できない / タイムアウト
+      return isBypass ? new Response("origin unreachable", { status: 502 }) : maintenanceResponse(env);
+    }
+
+    // 502 / 503 / 504 と、Cloudflare 独自の 520〜530 番台（オリジン到達不能など）
+    const failed = [502, 503, 504].includes(res.status) || (res.status >= 520 && res.status <= 530);
+    if (failed && !isBypass) return maintenanceResponse(env);
+
+    return res;
+  },
+};
+
+async function maintenanceResponse(env) {
+  let body = FALLBACK_HTML;
+  if (env.MAINTENANCE_URL) {
+    try {
+      const r = await fetch(env.MAINTENANCE_URL, {
+        signal: AbortSignal.timeout(3000),
+        cf: { cacheTtl: 60, cacheEverything: true }, // 静的ホスティング側の負荷も抑える
+      });
+      if (r.ok) body = await r.text();
+    } catch (_) {
+      // FALLBACK_HTML を使う
+    }
+  }
+  return new Response(body, {
+    status: 503,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Retry-After": "3600",
+      "Cache-Control": "no-store",
+      "X-Robots-Tag": "noindex",
+    },
+  });
+}
+
+// =============================================================================
+// 設定例（wrangler.toml）  ★ の箇所を書き換える
+//
+//   name = "maintenance-guard"
+//   main = "cloudflare-worker.js"
+//   compatibility_date = "2025-01-01"
+//
+//   routes = [{ pattern = "example.com/*", zone_name = "example.com" }]   # ★
+//
+//   [[kv_namespaces]]
+//   binding = "FLAGS"
+//   id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"                               # ★
+//
+//   [vars]
+//   MAINTENANCE_URL = "https://maintenance.example.pages.dev/maintenance.html"  # ★
+//   BYPASS_IPS = "203.0.113.10"                                                 # ★ カンマ区切り
+//   ORIGIN_TIMEOUT_MS = "15000"
+//
+// 運用（wrangler v4 以降。v3 以前は --remote を付けない）
+//   ON  : npx wrangler kv key put maintenance on --binding FLAGS --remote
+//   OFF : npx wrangler kv key delete maintenance --binding FLAGS --remote
+//
+// 注意
+//   - KV は結果整合のため、切り替えの反映に最大 1分ほどかかることがある。
+//   - Worker 自体がエラーになったときに備え、Cloudflare ダッシュボードの
+//     「カスタムエラーページ」にも同じ画面を登録しておくと、さらに堅牢。
+//   - 動作確認:  curl -I https://example.com/  -> 503 + Retry-After
+// =============================================================================

@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  web.config.sample  メンテナンスモード（IIS 用）
+
+  A. 手動スイッチ   : フラグファイルを置くと、全アクセスを 503 + メンテ画面にする
+  B. 自動フォールバック : 502 / 503 / 504 のとき、同じメンテ画面を表示する
+
+  使い方
+    1) public/maintenance.html をサイトのルートにコピーする
+    2) このファイルをサイトのルートに web.config としてコピーする
+       （既存の web.config がある場合は、system.webServer の中身をマージする）
+    3) 「★」の付いた箇所だけ環境に合わせて書き換える
+
+  必要なもの: URL Rewrite モジュール（IIS の追加インストールが必要）
+  注意: XML コメントの中にはハイフンを2つ続けて書けない（構文エラーになる）
+-->
+<configuration>
+  <system.webServer>
+
+    <!-- B. 自動フォールバック -->
+    <!--
+      responseMode="ExecuteURL" にすると、元のステータスコード（503 など）を保ったまま
+      静的HTMLを返せる。Redirect にすると 302 → 200 になり、SEO 上よくない。
+      existingResponse="Replace" は、FastCGI や ARR が返した本文も置き換えるために必要。
+    -->
+    <httpErrors errorMode="Custom" existingResponse="Replace">
+      <remove statusCode="502" />
+      <remove statusCode="503" />
+      <remove statusCode="504" />
+      <error statusCode="502" path="/maintenance.html" responseMode="ExecuteURL" />
+      <error statusCode="503" path="/maintenance.html" responseMode="ExecuteURL" />
+      <error statusCode="504" path="/maintenance.html" responseMode="ExecuteURL" />
+      <!--
+        アプリが返す 500 もメンテ画面にしたい場合は、次の2行を有効にする。
+        通常のアプリエラー画面も隠れるため、緊急時限定の運用を推奨。
+      <remove statusCode="500" />
+      <error statusCode="500" path="/maintenance.html" responseMode="ExecuteURL" />
+      -->
+    </httpErrors>
+
+    <!-- A. 手動スイッチ -->
+    <!--
+      有効化:  New-Item C:\inetpub\maintenance.flag -ItemType File
+      解除:    Remove-Item C:\inetpub\maintenance.flag
+      IIS の再起動は不要（リクエストのたびにファイルの有無を見る）。
+      フラグはサイトの公開フォルダの「外」に置く。
+    -->
+    <rewrite>
+      <rules>
+        <rule name="MaintenanceMode" stopProcessing="true">
+          <match url=".*" />
+          <conditions logicalGrouping="MatchAll">
+            <!-- フラグファイルがあるとき ★ 場所は変更可 -->
+            <add input="C:\inetpub\maintenance.flag" matchType="IsFile" />
+            <!-- 保守担当者の IP は除外 ★ 自分の IP に変更 -->
+            <add input="{REMOTE_ADDR}" pattern="^203\.0\.113\.10$" negate="true" />
+            <!-- メンテ画面自体は除外（ループ防止） -->
+            <add input="{REQUEST_URI}" pattern="^/maintenance\.html$" negate="true" />
+          </conditions>
+          <!-- 503 を返す → 上の httpErrors が maintenance.html を表示する -->
+          <action type="CustomResponse" statusCode="503"
+                  statusReason="Service Unavailable"
+                  statusDescription="Maintenance" />
+        </rule>
+      </rules>
+    </rewrite>
+
+  </system.webServer>
+
+  <!-- メンテ画面にだけ付けるヘッダー -->
+  <location path="maintenance.html">
+    <system.webServer>
+      <httpProtocol>
+        <customHeaders>
+          <!-- 1時間後に再試行してね（検索エンジン・クライアント向け） -->
+          <add name="Retry-After" value="3600" />
+          <!-- ブラウザ / CDN にメンテ画面を残さない -->
+          <add name="Cache-Control" value="no-store" />
+          <add name="X-Robots-Tag" value="noindex" />
+        </customHeaders>
+      </httpProtocol>
+    </system.webServer>
+  </location>
+</configuration>
+
+<!--
+  動作確認（PowerShell）
+    1) New-Item C:\inetpub\maintenance.flag -ItemType File
+       curl.exe -I http://example.com/     -> HTTP/1.1 503 Service Unavailable
+       ※ Retry-After が付いていない場合は、location ブロックの path と配置を確認する
+    2) Remove-Item C:\inetpub\maintenance.flag
+
+  制限事項
+    - アプリケーションプールが「停止」しているときの 503 は、IIS より手前の
+      HTTP.sys が返すため、httpErrors では置き換えられない。
+      この層は前段の LB / CDN（config/edge/ 参照）で担保する。
+      ASP.NET の場合は、アプリのルートに app_offline.htm を置く方法もある。
+    - フラグファイルのパスを書き換えた場合は、IIS のアカウントに読み取り権限が必要。
+-->
